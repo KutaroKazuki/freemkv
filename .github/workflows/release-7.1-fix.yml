@@ -54,7 +54,8 @@ jobs:
         if: ${{ hashFiles('macos/Info.plist') != '' }}
         run: |
           PLIST_VER="v$(sed -n 's/.*<key>CFBundleShortVersionString<\/key><string>\(.*\)<\/string>.*/\1/p' macos/Info.plist)"
-          BASE="${${{ github.ref_name }}%%-*}"
+          TAG="${{ github.ref_name }}"
+          BASE="${TAG%%-*}"
           if [ "$PLIST_VER" != "$BASE" ]; then
             echo "::warning::Info.plist says $PLIST_VER but tag base is $BASE"
           else
