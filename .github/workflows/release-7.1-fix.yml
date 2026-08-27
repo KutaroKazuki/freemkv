@@ -1,0 +1,348 @@
+name: Release 7.1 Fix
+
+# Faithful mirror of the upstream `release.yml`, scoped to the fork's 7.1-audio
+# fix. Builds the same artifacts the upstream release builds — macOS (.app/.dmg),
+# Windows (CLI .exe + desktop-app freemkv-gui.exe .zip), Linux (musl-static CLI) —
+# plus the `test` and `verify` gates.
+#
+# Differences from upstream, all deliberate:
+#   * No `update-homebrew-tap` / `update-homepage` jobs — those need
+#     ORG_DISPATCH_TOKEN and point at freemkv org infra, which a fork lacks.
+#   * `verify` is fork-tolerant: it compares the Cargo.toml base version against
+#     the tag prefix (v1.6.11 vs tag v1.6.11-7.1fix) and warns instead of
+#     failing, because this fork's tag carries a -7.1fix suffix.
+#   * macOS signing/notarization steps are kept but degrade gracefully when the
+#     MACOS_* secrets are absent (a fork has none) — exactly as upstream's own
+#     comments intend ("a fork's CI cannot read secrets, so a hard failure here
+#     would mean nobody but this repo could build the app at all").
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - '!v*-rc*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.6.11-7.1fix)'
+        required: true
+        default: 'v1.6.11-7.1fix'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Verify Cargo.toml version is the base of the tag (fork-tolerant)
+        run: |
+          CARGO_VER="v$(grep '^version' Cargo.toml | head -1 | sed 's/.*\"\(.*\)\"/\1/')"
+          TAG="${{ github.ref_name }}"
+          # Fork tag carries a -7.1fix suffix; compare base version only.
+          BASE="${TAG%%-*}"
+          if [ "$CARGO_VER" != "$BASE" ]; then
+            echo "::warning::Cargo.toml says $CARGO_VER but tag base is $BASE (continuing for fork build)"
+          else
+            echo "Version match: $CARGO_VER"
+          fi
+      - name: Verify Info.plist version (if present, warn on mismatch)
+        if: ${{ hashFiles('macos/Info.plist') != '' }}
+        run: |
+          PLIST_VER="v$(sed -n 's/.*<key>CFBundleShortVersionString<\/key><string>\(.*\)<\/string>.*/\1/p' macos/Info.plist)"
+          BASE="${${{ github.ref_name }}%%-*}"
+          if [ "$PLIST_VER" != "$BASE" ]; then
+            echo "::warning::Info.plist says $PLIST_VER but tag base is $BASE"
+          else
+            echo "Info.plist match: $PLIST_VER"
+          fi
+
+  # Parallel tripwire, exactly as the CLI does it: fails the run, but `build`
+  # does NOT `needs:` it, so packaging starts as soon as `verify` passes.
+  test:
+    needs: verify
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --tests
+
+  build:
+    # NOTE: deliberately does NOT `needs: test` — see the test job above.
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            asset: freemkv-aarch64-macos
+          - target: x86_64-apple-darwin
+            asset: freemkv-x86_64-macos
+
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # ── Developer ID signing ──
+      - name: Import the Developer ID certificate
+        id: signing
+        uses: ./.github/actions/import-developer-id
+        with:
+          certificate-p12: ${{ secrets.MACOS_CERT_P12 }}
+          certificate-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+          keychain-password: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+
+      - name: Bundle freemkv.app
+        env:
+          MACOS_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+        run: bash macos/bundle.sh release ${{ matrix.target }}
+
+      - name: Package the disk image
+        run: |
+          hdiutil create -volname "freemkv" -srcfolder target/freemkv.app \
+            -ov -format UDZO "${{ matrix.asset }}.dmg"
+
+      - name: Notarize and staple
+        if: steps.signing.outputs.signed == 'true'
+        env:
+          NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          A="${{ matrix.asset }}"
+          if ! xcrun notarytool submit "$A.dmg" \
+                 --key "$RUNNER_TEMP/notary.p8" \
+                 --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+                 --wait --timeout 30m; then
+            echo "::error::notarization was rejected — fetching the log"
+            rm -f "$RUNNER_TEMP/notary.p8"
+            exit 1
+          fi
+          rm -f "$RUNNER_TEMP/notary.p8"
+          xcrun stapler staple "$A.dmg"
+          xcrun stapler staple target/freemkv.app
+
+      - name: Finalize artifacts
+        run: |
+          set -euo pipefail
+          VER="${{ github.ref_name }}"
+          A="${{ matrix.asset }}"
+          ditto -c -k --keepParent target/freemkv.app "$A.zip"
+          cp "$A.dmg" "freemkv-$VER-${{ matrix.target }}.dmg"
+          cp "$A.zip" "freemkv-$VER-${{ matrix.target }}.zip"
+          shasum -a 256 \
+            "$A.dmg" "$A.zip" \
+            "freemkv-$VER-${{ matrix.target }}.dmg" \
+            "freemkv-$VER-${{ matrix.target }}.zip" \
+            > "$A.dmg.sha256"
+
+      - name: Verify the bundle
+        run: |
+          BIN=target/freemkv.app/Contents/MacOS/freemkv
+          case "${{ matrix.target }}" in
+            aarch64-*) WANT=arm64 ;;
+            x86_64-*)  WANT=x86_64 ;;
+          esac
+          lipo -archs "$BIN"
+          lipo -archs "$BIN" | grep -qw "$WANT" \
+            || { echo "::error::expected $WANT in $(lipo -archs "$BIN")"; exit 1; }
+          codesign --verify --deep --strict --verbose=2 target/freemkv.app
+          if [ "${{ steps.signing.outputs.signed }}" = "true" ]; then
+            spctl -a -vvv -t install "${{ matrix.asset }}.dmg"
+            xcrun stapler validate "${{ matrix.asset }}.dmg"
+            codesign -dv --verbose=4 target/freemkv.app 2>&1 | grep -q "Authority=Developer ID Application" \
+              || { echo "::error::bundle is not signed by a Developer ID authority"; exit 1; }
+          else
+            echo "ad-hoc build — skipping Gatekeeper checks (they would fail by design)"
+          fi
+
+      - name: Upload
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ${{ matrix.asset }}.dmg
+            ${{ matrix.asset }}.zip
+            ${{ matrix.asset }}.dmg.sha256
+            freemkv-*-${{ matrix.target }}.dmg
+            freemkv-*-${{ matrix.target }}.zip
+
+  # ── Windows desktop app ──
+  build-windows:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            asset: freemkv-x86_64-windows
+
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}-app
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver = "${{ github.ref_name }}"
+          $a   = "${{ matrix.asset }}"
+          $gui = "target/${{ matrix.target }}/release/freemkv-gui.exe"
+          if (-not (Test-Path $gui)) { throw "freemkv-gui.exe missing — the .zip would ship the console CLI as the desktop app" }
+          Compress-Archive -Path $gui -DestinationPath "$a.zip" -Force
+          Compress-Archive -Path $gui -DestinationPath "freemkv-$ver-${{ matrix.target }}.zip" -Force
+          $h = Get-FileHash -Algorithm SHA256 "$a.zip"
+          "$($h.Hash.ToLower())  $a.zip" | Out-File -Encoding ascii "$a.zip.sha256"
+
+      - name: Verify the binary
+        shell: pwsh
+        run: |
+          $out = & "target/${{ matrix.target }}/release/freemkv.exe" --version
+          if ($LASTEXITCODE -ne 0) {
+            Write-Output "::error::freemkv.exe --version exited $LASTEXITCODE"
+            exit 1
+          }
+          if ([string]::IsNullOrWhiteSpace($out)) {
+            Write-Output "::error::freemkv.exe --version printed nothing"
+            exit 1
+          }
+          Write-Output "freemkv.exe --version => $out"
+          $zip = (Resolve-Path "${{ matrix.asset }}.zip").Path
+          $names = [IO.Compression.ZipFile]::OpenRead($zip).Entries.FullName
+          Write-Output "zip contents: $($names -join ', ')"
+          if ($names -notcontains 'freemkv-gui.exe') {
+            Write-Output "::error::freemkv-gui.exe missing from ${{ matrix.asset }}.zip — that archive is the desktop app"
+            exit 1
+          }
+
+      - name: Upload
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ${{ matrix.asset }}.zip
+            ${{ matrix.asset }}.zip.sha256
+            freemkv-*-${{ matrix.target }}.zip
+
+  # ── Standalone CLI binaries ──
+  cli-binaries:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            asset: freemkv-x86_64-linux
+            ext: ''
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            asset: freemkv-aarch64-linux
+            ext: ''
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset: freemkv-aarch64-macos
+            ext: ''
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset: freemkv-x86_64-macos
+            ext: ''
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: freemkv-x86_64-windows
+            ext: '.exe'
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install cross
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: |
+          curl -sL https://github.com/cross-rs/cross/releases/download/v0.2.5/cross-x86_64-unknown-linux-musl.tar.gz | tar xz
+          sudo mv cross /usr/local/bin/
+      - name: Build CLI
+        if: matrix.target != 'aarch64-unknown-linux-musl'
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Build CLI (cross)
+        if: matrix.target == 'aarch64-unknown-linux-musl'
+        run: cross build --release --target ${{ matrix.target }}
+      - name: Import the Developer ID certificate
+        id: signing
+        if: runner.os == 'macOS'
+        uses: ./.github/actions/import-developer-id
+        with:
+          certificate-p12: ${{ secrets.MACOS_CERT_P12 }}
+          certificate-password: ${{ secrets.MACOS_CERT_PASSWORD }}
+          keychain-password: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+      - name: Sign and notarize the macOS CLI
+        if: runner.os == 'macOS' && steps.signing.outputs.signed == 'true'
+        env:
+          IDENTITY: ${{ steps.signing.outputs.identity }}
+          NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          BIN="target/${{ matrix.target }}/release/freemkv"
+          codesign --force --options runtime --timestamp --sign "$IDENTITY" "$BIN"
+          codesign --verify --strict --verbose=2 "$BIN"
+          ditto -c -k "$BIN" "$RUNNER_TEMP/notarize-cli.zip"
+          printf '%s' "$NOTARY_KEY_P8" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize-cli.zip" \
+            --key "$RUNNER_TEMP/notary.p8" \
+            --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 30m
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/notarize-cli.zip"
+          codesign -dv --verbose=4 "$BIN" 2>&1 | grep -q "Authority=Developer ID Application" \
+            || { echo "::error::CLI is not signed by a Developer ID authority"; exit 1; }
+      - name: Package
+        shell: bash
+        run: |
+          VER="${{ github.ref_name }}"
+          A="${{ matrix.asset }}"
+          E="${{ matrix.ext }}"
+          BIN="target/${{ matrix.target }}/release/freemkv$E"
+          cp "$BIN" "$A$E"
+          cp "$BIN" "$A-$VER$E"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            shasum -a 256 "$A$E" "$A-$VER$E" > "$A$E.sha256"
+          else
+            sha256sum "$A$E" "$A-$VER$E" > "$A$E.sha256"
+          fi
+      - name: Upload
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            ${{ matrix.asset }}${{ matrix.ext }}
+            ${{ matrix.asset }}-*${{ matrix.ext }}
+            ${{ matrix.asset }}${{ matrix.ext }}.sha256
