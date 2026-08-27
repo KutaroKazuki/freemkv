@@ -5717,4 +5717,88 @@ mod pure_helper_tests {
         assert_eq!(purpose_label(LabelPurpose::Ime), Some("IME"));
         assert_eq!(purpose_label(LabelPurpose::Normal), None);
     }
+
+    /// The GUI's title tree is built straight from `Scanned.rows` (one `Row`
+    /// per audio stream via `stream_rows`). When a disc scan surfaces a TrueHD
+    /// Atmos 7.1 track, the GUI must show it as its own audio row — the same
+    /// track the command line lists. This is the GUI-side counterpart of the
+    /// libfreemkv "7.1 across play items" fix: if the scan carries the 7.1,
+    /// `scanned_from_disc` must produce a row whose description contains "7.1".
+    /// Regression: an earlier scan read only the first play item's STN table,
+    /// so the 7.1 (which lives on a later item) never reached `Disc.streams`
+    /// and therefore never reached the GUI tree.
+    #[test]
+    fn gui_tree_shows_71_atmos_audio_row_from_scan() {
+        use super::*;
+        use libfreemkv::{AudioChannels, AudioStream, Codec, ContentFormat, Disc, DiscFormat, DiscTitle, Stream};
+        use libfreemkv::disc::{BdRegion, DiscRegion};
+
+        let disc = Disc {
+            volume_id: "GUI Test Disc".to_string(),
+            meta_title: None,
+            format: DiscFormat::Uhd,
+            capacity_sectors: 0,
+            capacity_bytes: 0,
+            layers: 1,
+            titles: vec![DiscTitle {
+                playlist: "00800.mpls".to_string(),
+                playlist_id: 800,
+                duration_secs: 7200.0,
+                size_bytes: 1 << 30,
+                clips: Vec::new(),
+                // 5.1 primary + 7.1 Atmos — the 7.1 is what the GUI must surface.
+                streams: vec![
+                    Stream::Audio(AudioStream {
+                        pid: 0x1100,
+                        codec: Codec::TrueHd,
+                        channels: AudioChannels::Surround51,
+                        language: "eng".into(),
+                        sample_rate: libfreemkv::SampleRate::S48,
+                        secondary: false,
+                        purpose: libfreemkv::LabelPurpose::Normal,
+                        label: String::new(),
+                    }),
+                    Stream::Audio(AudioStream {
+                        pid: 0x1101,
+                        codec: Codec::TrueHd,
+                        channels: AudioChannels::Surround71,
+                        language: "eng".into(),
+                        sample_rate: libfreemkv::SampleRate::S48,
+                        secondary: false,
+                        purpose: libfreemkv::LabelPurpose::Normal,
+                        label: String::new(),
+                    }),
+                ],
+                chapters: Vec::new(),
+                extents: Vec::new(),
+                content_format: ContentFormat::BdTs,
+                codec_privates: Vec::new(),
+            }],
+            region: DiscRegion::BluRay(vec![BdRegion::A]),
+            aacs: None,
+            css: None,
+            encrypted: false,
+            aacs_error: None,
+            css_error: None,
+            content_format: ContentFormat::BdTs,
+        };
+
+        let sc = scanned_from_disc(&disc, "none".to_string(), false);
+        let audio_rows: Vec<&Row> = sc
+            .rows
+            .iter()
+            .filter(|r| r.type_s == "Audio")
+            .collect();
+        assert_eq!(
+            audio_rows.len(),
+            2,
+            "both audio tracks must become GUI rows"
+        );
+        let has_71 = audio_rows.iter().any(|r| r.desc.contains("7.1"));
+        assert!(
+            has_71,
+            "the 7.1 Atmos track must render as a '7.1' audio row in the GUI tree: rows = {:?}",
+            audio_rows.iter().map(|r| &r.desc).collect::<Vec<_>>()
+        );
+    }
 }
