@@ -91,5 +91,5 @@ objc2-foundation = { version = "0.3", features = [
 [patch.crates-io]
 libfreemkv = { git = "https://github.com/KutaroKazuki/libfreemkv", tag = "v1.6.12-7.1fix" }
 freemkv-engine = { git = "https://github.com/freemkv/freemkv-engine", tag = "v1.6.12" }
-freemkv-keysources = { git = "https://github.com/freemkv/freemkv-keysources", tag = "v1.6.12" }
+freemkv-keysources = { git = "https://github.com/KutaroKazuki/freemkv-keysources", tag = "v1.6.12-7.1fix" }
 freemkv-i18n = { git = "https://github.com/freemkv/freemkv-i18n", tag = "v1.6.12" }
