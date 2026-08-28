@@ -630,7 +630,6 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 [[package]]
 name = "libfreemkv"
 version = "1.6.12"
-source = "git+https://github.com/freemkv/libfreemkv?tag=v1.6.12#c79acc3c9adf83e1a1f1c7f5c8f40294a0224a4f"
 dependencies = [
  "aes",
  "base64",
