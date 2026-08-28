@@ -1702,16 +1702,26 @@ fn keyless_scan_opts() -> libfreemkv::ScanOptions {
     libfreemkv::ScanOptions::default()
 }
 
-/// ScanOptions for a **live-drive** scan: keyless, plus the AACS host
-/// credentials for the authenticated handshake (sourced from the local keydb).
-/// A locked drive needs the cert to read its Volume ID; an unlocked /
-/// firmware-unlocked drive takes the OEM path and ignores them. ISO scans use
-/// [`keyless_scan_opts`].
+/// ScanOptions for a **live-drive** scan: structure + AACS inputs, plus the
+/// AACS host credentials for the authenticated handshake (sourced from the
+/// local keydb). A locked drive needs the cert to read its Volume ID; an
+/// unlocked / firmware-unlocked drive takes the OEM path and ignores them.
+///
+/// Unlike the historical keyless scan, we ALSO pass the local `keydb.cfg` as a
+/// key source so the scan resolves unit keys up front. This is what lets
+/// `correct_truehd_channels` / `correct_dts_channels` read the (now decrypted)
+/// audio bitstream and surface the real 7.1/Atmos channel count during the
+/// scan — matching MakeMKV, which also consults its keydb at scan time. No
+/// online source is added here: the scan must never phone a key service.
 pub(crate) fn drive_scan_opts(keydb_path: &Option<String>) -> libfreemkv::ScanOptions {
-    libfreemkv::ScanOptions {
+    let mut opts = libfreemkv::ScanOptions {
         credentials: drive_credentials(keydb_path),
         ..Default::default()
-    }
+    };
+    // Local keydb only (never online) — mirrors `key_params` minus `key_url`.
+    let local = freemkv_keysources::KeydbSource::new(resolved_keydb_path(keydb_path));
+    opts.key_sources.push(Box::new(local));
+    opts
 }
 
 /// Is the destination directory-STYLE — a trailing `/`, or an existing
@@ -3478,8 +3488,30 @@ mod tests {
         fmt_err_str, is_keyserver_url, is_metadata_sink, is_scheme_only_sink, is_url_token,
         mp4_skip_reason_key, parse_error_code, parse_flags, parse_stream_spec, preflight_validate,
         render_error, resolved_keydb_path, sanitize_name, title_in_range, validate_dir_input,
-        validate_file_dest, validate_iso_input,
+        validate_file_dest, validate_iso_input, drive_scan_opts,
     };
+
+    /// `drive_scan_opts` must wire the local keydb into the scan's key sources
+    /// so unit keys resolve during the scan (not just at rip time). This is what
+    /// lets `correct_truehd_channels` read the decrypted audio bitstream and show
+    /// the real 7.1/Atmos layout at scan time — matching MakeMKV. A keyless
+    /// scan (the old behaviour) left `unit_keys_resolved=0` and the 7.1 stuck at
+    /// the MPLS-declared 5.1.
+    #[test]
+    fn drive_scan_opts_injects_local_keydb_as_key_source() {
+        let opts = drive_scan_opts(&None);
+        // At least the local keydb source is present (no online source).
+        assert!(
+            !opts.key_sources.is_empty(),
+            "scan must carry the local keydb key source"
+        );
+        assert_eq!(
+            opts.key_sources.len(),
+            1,
+            "scan must NOT add an online key source"
+        );
+        assert_eq!(opts.key_sources[0].label(), "keydb");
+    }
 
     /// `dir://` source validation, which had no test at all.
     ///
